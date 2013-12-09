@@ -1500,10 +1500,15 @@ Json::Value RPCHandler::doRipplePathFind (Json::Value params, Resource::Charge& 
     RippleAddress   raDst;
     STAmount        saDstAmount;
     Ledger::pointer lpLedger;
-    Json::Value     jvResult    = lookupLedger (params, lpLedger);
 
-    if (!lpLedger)
-        return jvResult;
+    Json::Value     jvResult;
+
+    if (getConfig().RUN_STANDALONE || params.isMember("ledger") || params.isMember("ledger_index") || params.isMember("ledger_hash"))
+    { // The caller specified a ledger
+        jvResult = lookupLedger (params, lpLedger);
+        if (!lpLedger)
+            return jvResult;
+    }
 
     if (!params.isMember ("source_account"))
     {
@@ -1546,7 +1551,18 @@ Json::Value RPCHandler::doRipplePathFind (Json::Value params, Resource::Charge& 
     else
     {
         loadType = Resource::feeHighBurdenRPC;
-        Ledger::pointer lSnapShot = boost::make_shared<Ledger> (boost::ref (*lpLedger), false);
+        RippleLineCache::pointer cache;
+
+        if (lpLedger)
+        { // The caller specified a ledger
+            lpLedger = boost::make_shared<Ledger> (boost::ref (*lpLedger), false);
+            cache = boost::make_shared<RippleLineCache>(lpLedger);
+        }
+        else
+        { // Use the default ledger and cache
+            lpLedger = mNetOps->getValidatedLedger();
+            cache = PathRequest::getLineCache(lpLedger);
+        }
 
         masterLockHolder.unlock (); // As long as we have a locked copy of the ledger, we can unlock.
 
@@ -1583,7 +1599,6 @@ Json::Value RPCHandler::doRipplePathFind (Json::Value params, Resource::Charge& 
         jvResult["destination_account"] = raDst.humanAccountID ();
 
         Json::Value jvArray (Json::arrayValue);
-        RippleLineCache::pointer cache = boost::make_shared<RippleLineCache> (lSnapShot);
 
         for (unsigned int i = 0; i != jvSrcCurrencies.size (); ++i)
         {
@@ -1646,7 +1661,7 @@ Json::Value RPCHandler::doRipplePathFind (Json::Value params, Resource::Charge& 
                     1);
                 saMaxAmount.negate ();
 
-                LedgerEntrySet  lesSandbox (lSnapShot, tapNONE);
+                LedgerEntrySet  lesSandbox (lpLedger, tapNONE);
 
                 TER terResult   =
                     RippleCalc::rippleCalc (

@@ -73,7 +73,7 @@ public:
     bool                        mAdvanceWork;       // Publish thread has work to do
     int                         mFillInProgress;
 
-    bool                        mPathFindThread;    // Pathfind thread is running
+    int                         mPathFindThread;    // Pathfinder jobs dispatched
     bool                        mPathFindNewLedger;
     bool                        mPathFindNewRequest;
 
@@ -94,7 +94,7 @@ public:
         , mAdvanceThread (false)
         , mAdvanceWork (false)
         , mFillInProgress (0)
-        , mPathFindThread (false)
+        , mPathFindThread (0)
         , mPathFindNewRequest (false)
     {
     }
@@ -842,13 +842,7 @@ public:
                 }
 
                 getApp().getOPs().clearNeedNetworkLedger();
-
-                if (!mPathFindThread)
-                {
-                    mPathFindThread = true;
-                    getApp().getJobQueue ().addJob (jtUPDATE_PF, "updatePaths",
-                        BIND_TYPE (&LedgerMasterImp::updatePaths, this, P_1));
-                }
+                newPFWork ("pf:newLedger");
             }
             if (progress)
                 mAdvanceWork = true;
@@ -999,45 +993,39 @@ public:
     {
         Ledger::pointer lastLedger;
 
-        if (getApp().getOPs().isNeedNetworkLedger ())
+        if (getApp().getOPs().isNeedNetworkLedger () || !mCurrentLedger)
         {
             ScopedLockType ml (mLock, __FILE__, __LINE__);
-            mPathFindThread = false;
+            --mPathFindThread;
             return;
         }
 
         while (! job.shouldCancel())
         {
-            bool newOnly = true;
-            bool hasNew = mPathFindNewRequest;
-
             {
                 ScopedLockType ml (mLock, __FILE__, __LINE__);
 
-                if (!mPathLedger || (mPathLedger->getLedgerSeq() < mValidLedger->getLedgerSeq()))
+                if (mValidLedger &&
+                    (!mPathLedger || (mPathLedger->getLedgerSeq() < mValidLedger->getLedgerSeq())))
                 { // We have a new valid ledger since the last full pathfinding
-                    newOnly = false;
                     mPathLedger = mValidLedger;
                     lastLedger = mPathLedger;
                 }
-                else if (mPathFindNewRequest)
+                else if (mPathFindNewRequest && mCurrentLedger)
                 { // We have a new request but no new ledger
-                    newOnly = true;
                     lastLedger = boost::make_shared<Ledger> (boost::ref (*mCurrentLedger), false);
                 }
                 else
                 { // Nothing to do
-                    mPathFindThread = false;
+                    --mPathFindThread;
                     return;
                 }
-
-                mPathFindNewRequest = false;
             }
 
             try
             {
                 // VFALCO TODO Fix this global variable
-                PathRequest::updateAll (lastLedger, newOnly, hasNew, job.getCancelCallback ());
+                PathRequest::updateAll (lastLedger, job.getCancelCallback ());
             }
             catch (SHAMapMissingNode&)
             {
@@ -1052,12 +1040,16 @@ public:
         ScopedLockType ml (mLock, __FILE__, __LINE__);
         mPathFindNewRequest = true;
 
-        if (!mPathFindThread)
-        {
-            mPathFindThread = true;
-            getApp().getJobQueue ().addJob (jtUPDATE_PF, "updatePaths",
-                BIND_TYPE (&LedgerMasterImp::updatePaths, this, P_1));
-        }
+        newPFWork("pf:newRequest");
+    }
+
+    bool isNewPathRequest ()
+    {
+        ScopedLockType ml (mLock, __FILE__, __LINE__);
+        if (!mPathFindNewRequest)
+            return false;
+        mPathFindNewRequest = false;
+        return true;
     }
 
     // If the order book is radically updated, we need to reprocess all pathfinding requests
@@ -1066,10 +1058,17 @@ public:
         ScopedLockType ml (mLock, __FILE__, __LINE__);
         mPathLedger.reset();
 
-        if (!mPathFindThread)
+        newPFWork("pf:newOBDB");
+    }
+
+    /** A thread needs to be dispatched to handle pathfinding work of some kind
+    */
+    void newPFWork (const char *name)
+    {
+        if (mPathFindThread < 2)
         {
-            mPathFindThread = true;
-            getApp().getJobQueue ().addJob (jtUPDATE_PF, "updatePaths",
+            ++mPathFindThread;
+            getApp().getJobQueue().addJob (jtUPDATE_PF, name,
                 BIND_TYPE (&LedgerMasterImp::updatePaths, this, P_1));
         }
     }

@@ -21,7 +21,7 @@ SETUP_LOG (PathRequest)
 
 // VFALCO TODO Move these globals into a PathRequests collection inteface
 PathRequest::StaticLockType PathRequest::sLock ("PathRequest", __FILE__, __LINE__);
-std::set <PathRequest::wptr> PathRequest::sRequests;
+std::vector <PathRequest::wptr> PathRequest::sRequests;
 RippleLineCache::pointer PathRequest::sLineCache;
 Atomic<int> PathRequest::siLastIdentifier(0);
 
@@ -30,7 +30,7 @@ PathRequest::PathRequest (const boost::shared_ptr<InfoSub>& subscriber)
     , wpSubscriber (subscriber)
     , jvStatus (Json::objectValue)
     , bValid (false)
-    , bNew (true)
+    , iLastIndex (0)
     , iLastLevel (0)
     , bLastSuccess (false)
     , iIdentifier (++siLastIdentifier)
@@ -49,10 +49,23 @@ bool PathRequest::isValid ()
     return bValid;
 }
 
-bool PathRequest::isNew ()
+bool PathRequest::needsUpdate (bool newOnly, LedgerIndex index)
 {
     ScopedLockType sl (mLock, __FILE__, __LINE__);
-    return bNew;
+    if (newOnly)
+    { // we only want to handle new requests
+        if (iLastIndex != 0)
+            return false;
+        iLastIndex = 1;
+        return true;
+    }
+    else
+    {
+        if (iLastIndex >= index)
+            return false;
+        iLastIndex = index;
+        return true;
+    }
 }
 
 bool PathRequest::isValid (Ledger::ref lrLedger)
@@ -131,14 +144,15 @@ Json::Value PathRequest::doCreate (Ledger::ref lrLedger, const Json::Value& valu
             mValid = isValid (ledger);
 
             if (mValid)
-            {
-                doUpdate (cache, true);
-            }
+                status = doUpdate (cache, true);
+            else
+                status = jvStatus;
         }
         else
+        {
             mValid = false;
-
-        status = jvStatus;
+            status = jvStatus;
+        }
     }
 
     if (mValid)
@@ -148,7 +162,7 @@ Json::Value PathRequest::doCreate (Ledger::ref lrLedger, const Json::Value& valu
         WriteLog (lsINFO, PathRequest) << iIdentifier << " Deliver: " << saDstAmount.getFullText ();
 
         StaticScopedLockType sl (sLock, __FILE__, __LINE__);
-        sRequests.insert (shared_from_this ());
+        sRequests.push_back (shared_from_this ());
     }
     else
         WriteLog (lsINFO, PathRequest) << iIdentifier << " invalid";
@@ -267,17 +281,14 @@ void PathRequest::resetLevel (int l)
         iLastLevel = l;
 }
 
-bool PathRequest::doUpdate (RippleLineCache::ref cache, bool fast)
+Json::Value PathRequest::doUpdate (RippleLineCache::ref cache, bool fast)
 {
     WriteLog (lsDEBUG, PathRequest) << iIdentifier << " update " << (fast ? "fast" : "normal");
     ScopedLockType sl (mLock, __FILE__, __LINE__);
     jvStatus = Json::objectValue;
 
     if (!isValid (cache->getLedger ()))
-        return false;
-
-    if (!fast)
-        bNew = false;
+        return jvStatus;
 
     std::set<currIssuer_t> sourceCurrencies (sciSourceCurrencies);
 
@@ -411,7 +422,7 @@ bool PathRequest::doUpdate (RippleLineCache::ref cache, bool fast)
     bLastSuccess = found;
 
     jvStatus["alternatives"] = jvArray;
-    return true;
+    return jvStatus;
 }
 
 /** Get the current RippleLineCache, updating it if necessary.
@@ -425,7 +436,7 @@ RippleLineCache::pointer PathRequest::getLineCache (Ledger::pointer& ledger)
         (lineSeq < ledger->getLedgerSeq()) ||         // Cache is out of date
         (lineSeq > (ledger->getLedgerSeq() + 16)))    // We jumped way back somehow
     {
-        ledger = boost::make_shared<Ledger>(*ledger, false);
+        ledger = boost::make_shared<Ledger>(*ledger, false); // Take a snapshot of the ledger
         sLineCache = boost::make_shared<RippleLineCache> (ledger);
     }
     else
@@ -435,9 +446,9 @@ RippleLineCache::pointer PathRequest::getLineCache (Ledger::pointer& ledger)
     return sLineCache;
 }
 
-void PathRequest::updateAll (Ledger::ref inLedger, bool newOnly, bool hasNew, CancelCallback shouldCancel)
+void PathRequest::updateAll (Ledger::ref inLedger, CancelCallback shouldCancel)
 {
-    std::set<wptr> requests;
+    std::vector<wptr> requests;
 
     LoadEvent::autoptr event (getApp().getJobQueue().getLoadEventAP(jtPATH_FIND, "PathRequest::updateAll"));
 
@@ -450,57 +461,105 @@ void PathRequest::updateAll (Ledger::ref inLedger, bool newOnly, bool hasNew, Ca
         cache = getLineCache (ledger);
     }
 
-    if (requests.empty ())
-        return;
+    bool newRequests = getApp().getLedgerMaster().isNewPathRequest();
+    bool mustBreak = false;
 
     WriteLog (lsDEBUG, PathRequest) << "updateAll seq=" << ledger->getLedgerSeq() <<
-        (newOnly ? " newOnly, " : " all, ") << requests.size() << " requests";
-
+        requests.size() << " requests";
     int processed = 0, removed = 0;
 
-    BOOST_FOREACH (wref wRequest, requests)
+    do
     {
-        if (shouldCancel())
-            break;
 
-        bool remove = true;
-        PathRequest::pointer pRequest = wRequest.lock ();
+        { // Get the latest requests, cache, and ledger
+            StaticScopedLockType sl (sLock, __FILE__, __LINE__);
 
-        if (pRequest)
-        {
-            // Drop old requests level to get new ones done faster
-            if (hasNew)
-                pRequest->resetLevel(getConfig().PATH_SEARCH);
+            if (sRequests.empty())
+                return;
 
-            if (newOnly && !pRequest->isNew ())
-                remove = false;
-            else
+            // Newest request is last in sRequests, but we want to serve it first
+            requests.empty();
+            requests.reserve(sRequests.size ());
+            BOOST_REVERSE_FOREACH (wptr& req, sRequests)
             {
-                InfoSub::pointer ipSub = pRequest->wpSubscriber.lock ();
+               requests.push_back (req);
+            }
 
-                if (ipSub)
-                {
-                    Json::Value update;
-                    {
-                        ScopedLockType sl (pRequest->mLock, __FILE__, __LINE__);
-                        pRequest->doUpdate (cache, false);
-                        update = pRequest->jvStatus;
-                    }
-                    update["type"] = "path_find";
-                    ipSub->send (update, false);
+            cache = getLineCache (ledger);
+        }
+
+        BOOST_FOREACH (wref wRequest, requests)
+        {
+            if (shouldCancel())
+                break;
+
+            bool remove = true;
+            PathRequest::pointer pRequest = wRequest.lock ();
+
+            if (pRequest)
+            {
+                if (!pRequest->needsUpdate (newRequests, ledger->getLedgerSeq ()))
                     remove = false;
-                    ++processed;
+                else
+                {
+                    InfoSub::pointer ipSub = pRequest->wpSubscriber.lock ();
+
+                    if (ipSub)
+                    {
+                        Json::Value update = pRequest->doUpdate (cache, false);
+                        update["type"] = "path_find";
+                        ipSub->send (update, false);
+                        remove = false;
+                        ++processed;
+                    }
                 }
             }
+
+            if (remove)
+            {
+                PathRequest::pointer pRequest = wRequest.lock ();
+
+                StaticScopedLockType sl (sLock, __FILE__, __LINE__);
+
+                // Remove any dangling weak pointers or weak pointers that refer to this path request.
+                std::vector<wptr>::iterator it = sRequests.begin();
+                while (it != sRequests.end())
+                {
+                    PathRequest::pointer itRequest = it->lock ();
+                    if (!itRequest || (itRequest == pRequest))
+                    {
+                        ++removed;
+                        sRequests.erase (it);
+                    }
+                    else
+                        ++it;
+                }
+            }
+
+            mustBreak = !newRequests && getApp().getLedgerMaster().isNewPathRequest();
+            if (mustBreak) // We weren't handling new requests and then there was a new request
+                break;
+
         }
 
-        if (remove)
-        {
-            ++removed;
-            StaticScopedLockType sl (sLock, __FILE__, __LINE__);
-            sRequests.erase (wRequest);
+        if (mustBreak)
+        { // a new request came in while we were working
+            newRequests = true;
         }
+        else if (newRequests)
+        { // we only did new requests, so we always need a last pass
+            newRequests = getApp().getLedgerMaster().isNewPathRequest();
+        }
+        else
+        { // check if there are any new requests, otherwise we are done
+            newRequests = getApp().getLedgerMaster().isNewPathRequest();
+            if (!newRequests) // We did a full pass and there are no new requests
+                return;
+        }
+
     }
+    while (!shouldCancel ());
+
     WriteLog (lsDEBUG, PathRequest) << "updateAll complete " << processed << " process and " <<
         removed << " removed";
 }
